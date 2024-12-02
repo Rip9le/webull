@@ -3,13 +3,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+bfg.jar
+
 # C extensions
 *.so
 
 # Distribution / packaging
 .Python
-env/
-venv/
+.env
+.venv/
 *.egg-info/
 dist/
 build/
@@ -31,3 +33,9 @@ build/
 # Environment configuration
 .env
 
+# Ignore PyCharm project settings
+.idea/
+
+# Ignore logs and data folders
+logs/
+data/

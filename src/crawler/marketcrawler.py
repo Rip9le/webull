@@ -12,7 +12,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("marketcrawler.log"),  # 日志写入文件
+        logging.FileHandler("../../logs/marketcrawler.log"),  # 日志写入文件
         logging.StreamHandler()  # 控制台输出日志
     ]
 )
