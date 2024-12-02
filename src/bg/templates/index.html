@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Ticker Data Viewer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <h1>Binance 24hr Ticker Data Viewer</h1>
+
+    <!-- 查询表单 -->
+    <form method="post">
+        <label for="symbol">Symbol (e.g., BTCUSDT):</label>
+        <input type="text" id="symbol" name="symbol" required>
+        <button type="submit">Query</button>
+    </form>
+
+    <!-- 数据表格 -->
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Symbol</th>
+                <th>Price Change</th>
+                <th>Price Change %</th>
+                <th>Weighted Avg Price</th>
+                <th>Last Price</th>
+                <th>Last Qty</th>
+                <th>Bid Price</th>
+                <th>Bid Qty</th>
+                <th>Ask Price</th>
+                <th>Ask Qty</th>
+                <th>Open Price</th>
+                <th>High Price</th>
+                <th>Low Price</th>
+                <th>Volume</th>
+                <th>Quote Volume</th>
+                <th>Open Time</th>
+                <th>Close Time</th>
+                <th>First ID</th>
+                <th>Last ID</th>
+                <th>Trade Count</th>
+                <th>Data Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% if data %}
+                {% for row in data %}
+                <tr>
+                    <td>{{ row[0] }}</td>
+                    <td>{{ row[1] }}</td>
+                    <td>{{ row[2] }}</td>
+                    <td>{{ row[3] }}</td>
+                    <td>{{ row[4] }}</td>
+                    <td>{{ row[5] }}</td>
+                    <td>{{ row[6] }}</td>
+                    <td>{{ row[7] }}</td>
+                    <td>{{ row[8] }}</td>
+                    <td>{{ row[9] }}</td>
+                    <td>{{ row[10] }}</td>
+                    <td>{{ row[11] }}</td>
+                    <td>{{ row[12] }}</td>
+                    <td>{{ row[13] }}</td>
+                    <td>{{ row[14] }}</td>
+                    <td>{{ row[15] }}</td>
+                    <td>{{ row[16] }}</td>
+                    <td>{{ row[17] }}</td>
+                    <td>{{ row[18] }}</td>
+                    <td>{{ row[19] }}</td>
+                    <td>{{ row[20] }}</td>
+                </tr>
+                {% endfor %}
+            {% else %}
+                <tr>
+                    <td colspan="21" style="text-align:center;">No data available</td>
+                </tr>
+            {% endif %}
+        </tbody>
+    </table>
+</body>
+</html>
