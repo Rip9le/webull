@@ -1,4 +1,4 @@
-# LB requirements
+# WB requirements
 
 ## 项目目标
 1. 爬取主流交易所(CEX and DEX)行情数据, 并筛选出涨跌榜。
