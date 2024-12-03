@@ -1,233 +1,208 @@
-import requests
-import psycopg2
-import redis
-import json
-import time
+import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-from apscheduler.schedulers.background import BackgroundScheduler
+
+import aioredis
+import asyncpg
+import json
+import websockets
+from datetime import datetime
+
+from aioredis import Redis
+from dotenv import load_dotenv
+import os
+import signal
+
+# 加载环境变量
+load_dotenv()
 
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("../../logs/marketcrawler.log"),  # 日志写入文件
-        logging.StreamHandler()  # 控制台输出日志
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# PostgreSQL 配置
+# 从环境变量中获取数据库配置
 DB_CONFIG = {
-    "database": "longbull",
-    "user": "mando",
-    "password": "U4AXRLDQuVau7MGEKKbU",
-    "host": "localhost",
-    "port": "5432"
+    'user': os.getenv('POSTGRES_USER'),
+    'password': os.getenv('POSTGRES_PASSWORD'),
+    'database': os.getenv('POSTGRES_DB'),
+    'host': os.getenv('POSTGRES_HOST'),
+    'port': os.getenv('POSTGRES_PORT'),
 }
 
+# Binance WebSocket地址
+WS_URL = 'wss://stream.binance.com:9443/ws/!ticker@arr'
+
 # Redis 配置
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_DB = 0
-
-# Redis 连接
-redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
 
 
-# 检查数据库中是否有当天数据
-def has_today_data():
+# 初始化 Redis 连接
+async def init_redis():
+    return await aioredis.from_url(REDIS_URL)
+
+
+# 初始化 PostgreSQL 连接
+async def init_postgres():
+    return await asyncpg.create_pool(
+        database=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT
+    )
+
+
+# 数据校验函数
+def validate_data(data):
+    required_fields = [
+        'e', 'E', 's', 'p', 'P', 'w', 'x', 'c', 'Q',
+        'b', 'B', 'a', 'A', 'o', 'h', 'l', 'v', 'q',
+        'O', 'C', 'F', 'L', 'n'
+    ]
+    for field in required_fields:
+        if field not in data:
+            raise ValueError(f"Missing field: {field}")
+
+    # 验证字段类型
+    if not isinstance(data['E'], int):
+        raise TypeError(f"Invalid type for event_time: {data['E']}")
+    if not isinstance(data['s'], str):
+        raise TypeError(f"Invalid type for symbol: {data['s']}")
+
+    # 验证数值字段
+    numeric_fields = ['p', 'P', 'w', 'x', 'c', 'Q', 'b', 'B', 'a', 'A', 'o', 'h', 'l', 'v', 'q']
+    for field in numeric_fields:
+        if data[field] is not None and not isinstance(data[field], (int, float, str)):
+            raise TypeError(f"Invalid type for {field}: {data[field]}")
+
+    # 验证范围
+    if float(data['P']) < 0:
+        raise ValueError(f"Price change percent cannot be negative: {data['P']}")
+
+    return True  # 数据有效
+
+
+# 保存数据到数据库
+async def save_to_db(pool, data):
     try:
-        url = "https://api.binance.com/api/v3/time"
-        response = requests.get(url)
-        if response.status_code != 200:
-            raise Exception("Failed to fetch Binance server time")
-
-        server_time = response.json()['serverTime'] / 1000  # 转换为秒
-        server_date = datetime.fromtimestamp(server_time, tz=timezone.utc).date()  # 转为 UTC 日期
-
-        # 连接 PostgreSQL 数据库
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-
-        # 查询当天数据是否存在
-        cursor.execute("""SELECT COUNT(*) FROM price_data_history 
-            WHERE DATE(close_time) = %s""", (server_date,))
-        count = cursor.fetchone()[0]
-
-        cursor.close()
-        conn.close()
-
-        return count > 0
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute('''
+                    INSERT INTO market_tickers (
+                        event_type, event_time, symbol, price_change, price_change_percent,
+                        weighted_avg_price, prev_close_price, last_price, last_qty,
+                        bid_price, bid_qty, ask_price, ask_qty, open_price, high_price,
+                        low_price, volume, quote_volume, open_time, close_time,
+                        first_trade_id, last_trade_id, trade_count
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                        $16, $17, $18, $19, $20, $21, $22, $23
+                    )
+                ''', (
+                    data.get('e'), data.get('E'), data.get('s'), data.get('p'),
+                    data.get('P'), data.get('w'), data.get('x'), data.get('c'),
+                    data.get('Q'), data.get('b'), data.get('B'), data.get('a'),
+                    data.get('A'), data.get('o'), data.get('h'), data.get('l'),
+                    data.get('v'), data.get('q'), data.get('O'), data.get('C'),
+                    data.get('F'), data.get('L'), data.get('n')
+                ))
+    except asyncpg.PostgresError as e:
+        logging.error(f"Database error: {e}")
+    except KeyError as e:
+        logging.warning(f"Missing key in data: {e}")
     except Exception as e:
-        logging.error(f"Error checking today's data: {e}")
-        return False
+        logging.error(f"Unexpected error during data saving: {e}")
 
 
-# 获取 Binance API 数据
-def fetch_binance_data():
+# 保存数据到 Redis
+async def save_to_redis(redis_client, data):
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        response = requests.get(url)
-        if response.status_code == 200:
-            logging.info("Binance data fetched successfully.")
-            return response.json()
+        symbol = data['s']
+        price_change_percent = data['P']
+
+        # 将涨跌幅存入 Redis
+        await redis_client.zadd('price_change_rank', {symbol: float(price_change_percent)})
+    except Exception as e:
+        logging.error(f"Error saving data to Redis: {e}")
+
+
+async def handle_message(pool, redis_client, message):
+    """
+    处理 WebSocket 推送的消息，更新 Redis 和 PostgreSQL 数据。
+    """
+    try:
+        data = json.loads(message)
+
+        # 确保 data 是列表，统一处理逻辑
+        if isinstance(data, dict):
+            data = [data]  # 如果是单个字典，转换为列表
+
+        # 遍历处理列表中的每个元素
+        if isinstance(data, list):
+            for item in data:
+                if validate_data(item):
+                    await save_to_db(pool, item)
+                    await save_to_redis(redis_client, item)
+                else:
+                    logging.warning(f"Invalid data skipped: {item}")
         else:
-            logging.error(f"Failed to fetch Binance data: {response.status_code}")
-            return None
-    except Exception as e:
-        logging.error(f"Error fetching Binance data: {e}")
-        return None
+            logging.warning(f"Unexpected data type: {type(data)}")
 
-# 取数据库中的最新数据
-def get_existing_latest_close_times():
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON message: {e}")
+    except Exception as e:
+        logging.error(f"Error processing message: {e}")
+
+
+async def connect_to_binance(pool, redis_client):
     """
-    获取数据库中每个 symbol 对应的最新 close_time。
-    返回字典 {symbol: close_time}
+    连接 Binance WebSocket 并处理消息。
     """
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-
-    # 查询每个 symbol 的最新 close_time
-    cursor.execute("""
-        SELECT DISTINCT ON (symbol) symbol, close_time
-        FROM price_data_history
-        ORDER BY symbol, close_time DESC
-    """)
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    # 组织为字典形式 {symbol: close_time}
-    existing_data = {symbol: close_time for symbol, close_time in rows}
-    return existing_data
-
-# 保存数据到 PostgreSQL
-def save_to_postgresql(data):
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-
-        for item in data:
-            cursor.execute("""
-                INSERT INTO price_data_history (symbol, price_change, price_change_percent, last_price, high_price, 
-                                                    low_price, volume, quote_volume, open_time, close_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000), to_timestamp(%s / 1000))
-                ON CONFLICT (symbol, close_time) DO NOTHING;
-            """, (
-                item['symbol'],
-                float(item['priceChange']),
-                float(item['priceChangePercent']),
-                float(item['lastPrice']),
-                float(item['highPrice']),
-                float(item['lowPrice']),
-                float(item['volume']),
-                float(item['quoteVolume']),
-                item['openTime'],
-                item['closeTime']
-            ))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-        logging.info("Data saved to PostgreSQL successfully.")
-    except Exception as e:
-        logging.error(f"Error saving data to PostgreSQL: {e}")
-
-
-# 计算涨跌幅前 20 的币种
-def calculate_top_gainers_and_losers(data):
-    try:
-        sorted_data = sorted(data, key=lambda x: float(x['priceChangePercent']), reverse=True)
-        top_gainers = sorted_data[:20]
-
-        sorted_data = sorted(data, key=lambda x: float(x['priceChangePercent']))
-        top_losers = sorted_data[:20]
-
-        logging.info("Top gainers and losers calculated successfully.")
-        return top_gainers, top_losers
-    except Exception as e:
-        logging.error(f"Error calculating top gainers and losers: {e}")
-        return [], []
-
-
-# 保存结果到 Redis
-def save_to_redis(key, data):
-    try:
-        redis_client.set(key, json.dumps(data), ex=86400)  # 缓存 24 小时
-        logging.info(f"{key} saved to Redis successfully.")
-    except Exception as e:
-        logging.error(f"Error saving {key} to Redis: {e}")
-
-
-# 动态调整频率的检测新数据逻辑
-def fetch_data_at_midnight():
-    interval = 300  # 初始检测间隔 5 分钟
     while True:
-        now = datetime.now(timezone.utc)
-        remaining_minutes = (60 - now.minute) + (23 - now.hour) * 60
-
-        # 缩短检测间隔在凌晨前后
-        if remaining_minutes <= 10:
-            interval = 60  # 1 分钟检测一次
-        elif remaining_minutes <= 30:
-            interval = 180  # 3 分钟检测一次
-
-        # 检测新数据是否可用
-        if is_new_day_data_available():
-            logging.info("New day data available. Fetching now...")
-            data = fetch_binance_data()
-            if data:
-                save_to_postgresql(data)
-                top_gainers, top_losers = calculate_top_gainers_and_losers(data)
-                save_to_redis("top_gainers", top_gainers)
-                save_to_redis("top_losers", top_losers)
-            break
-        else:
-            logging.info(f"New data not available. Retrying in {interval} seconds.")
-            time.sleep(interval)
+        try:
+            async with websockets.connect(WS_URL) as websocket:
+                logging.info("Connected to Binance WebSocket.")
+                async for message in websocket:
+                    await handle_message(pool, redis_client, message)
+        except websockets.exceptions.ConnectionClosedError as e:
+            logging.error(f"WebSocket connection closed: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Unexpected error during WebScoket connection: {e}")
+            await asyncio.sleep(5)
 
 
-# 检测 API 数据是否更新到新一天
-def is_new_day_data_available():
+async def cleanup_resources(pool, redis_client):
+    logging.info("Cleaning up resources...")
+    if pool:
+        await pool.close()
+    if redis_client:
+        await redis_client.close()
+
+
+# 主函数
+async def main():
+    # 初始化数据库连接池和 Redis 客户端
+    pool = await asyncpg.create_pool(**DB_CONFIG)
+    redis_client = await aioredis.from_url(REDIS_URL)
+
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            if len(data) > 0:
-                close_time = data[0]['closeTime'] / 1000
-                close_date = datetime.fromtimestamp(close_time, tz=timezone.utc).date()
-                current_date = datetime.now(timezone.utc).date()
-                return close_date == current_date
-        return False
+        await connect_to_binance(pool, redis_client)
     except Exception as e:
-        logging.error(f"Error checking new day data: {e}")
-        return False
+        # 确保资源清理
+        await cleanup_resources(pool, redis_client)
+        logging.error(f"Failed to initialize: {e}")
 
 
-# 定时任务逻辑
-def main_task():
-    if not has_today_data():
-        logging.info("No data for today. Checking for new data...")
-        fetch_data_at_midnight()
-    else:
-        logging.info("Today's data already exists.")
-
-
-# 主程序入口
-if __name__ == "__main__":
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(main_task, 'cron', hour=0, minute=0)  # 每天凌晨 0 点执行
-    scheduler.start()
-
-    logging.info("Scheduler is running. Press Ctrl+C to exit.")
-
-    # 程序启动时立即检查并触发主任务
-    main_task()
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    pool, redis_client = None, None  # 初始化资源为 None
 
     try:
-        while True:
-            pass
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+        # 处理终止信号
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(cleanup_resources(pool, redis_client)))
+
+        loop.run_until_complete(main())
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+    finally:
+        loop.close()
