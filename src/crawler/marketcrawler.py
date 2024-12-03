@@ -1,16 +1,16 @@
 import asyncio
 import logging
-
-import aioredis
-import asyncpg
+import redis.asyncio as redis
 import json
 import websockets
-from datetime import datetime
-
-from aioredis import Redis
 from dotenv import load_dotenv
 import os
 import signal
+import ssl
+
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
 
 # 加载环境变量
 load_dotenv()
@@ -32,22 +32,6 @@ WS_URL = 'wss://stream.binance.com:9443/ws/!ticker@arr'
 
 # Redis 配置
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
-
-
-# 初始化 Redis 连接
-async def init_redis():
-    return await aioredis.from_url(REDIS_URL)
-
-
-# 初始化 PostgreSQL 连接
-async def init_postgres():
-    return await asyncpg.create_pool(
-        database=POSTGRES_DB,
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        host=POSTGRES_HOST,
-        port=POSTGRES_PORT
-    )
 
 
 # 数据校验函数
@@ -74,52 +58,61 @@ def validate_data(data):
             raise TypeError(f"Invalid type for {field}: {data[field]}")
 
     # 验证范围
-    if float(data['P']) < 0:
-        raise ValueError(f"Price change percent cannot be negative: {data['P']}")
+    # if float(data['P']) < 0:
+    #     raise ValueError(f"Price change percent cannot be negative: {data['P']}")
 
     return True  # 数据有效
 
 
 # 保存数据到数据库
-async def save_to_db(pool, data):
-    try:
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute('''
-                    INSERT INTO market_tickers (
-                        event_type, event_time, symbol, price_change, price_change_percent,
-                        weighted_avg_price, prev_close_price, last_price, last_qty,
-                        bid_price, bid_qty, ask_price, ask_qty, open_price, high_price,
-                        low_price, volume, quote_volume, open_time, close_time,
-                        first_trade_id, last_trade_id, trade_count
-                    ) VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                        $16, $17, $18, $19, $20, $21, $22, $23
-                    )
-                ''', (
-                    data.get('e'), data.get('E'), data.get('s'), data.get('p'),
-                    data.get('P'), data.get('w'), data.get('x'), data.get('c'),
-                    data.get('Q'), data.get('b'), data.get('B'), data.get('a'),
-                    data.get('A'), data.get('o'), data.get('h'), data.get('l'),
-                    data.get('v'), data.get('q'), data.get('O'), data.get('C'),
-                    data.get('F'), data.get('L'), data.get('n')
-                ))
-    except asyncpg.PostgresError as e:
-        logging.error(f"Database error: {e}")
-    except KeyError as e:
-        logging.warning(f"Missing key in data: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error during data saving: {e}")
+# async def save_to_db(pool, data):
+#     try:
+#         async with pool.acquire() as connection:
+#             async with connection.transaction():
+#                 await connection.execute('''
+#                     INSERT INTO market_tickers (
+#                         event_type, event_time, symbol, price_change, price_change_percent,
+#                         weighted_avg_price, prev_close_price, last_price, last_qty,
+#                         bid_price, bid_qty, ask_price, ask_qty, open_price, high_price,
+#                         low_price, volume, quote_volume, open_time, close_time,
+#                         first_trade_id, last_trade_id, trade_count
+#                     ) VALUES (
+#                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+#                         $16, $17, $18, $19, $20, $21, $22, $23
+#                     )
+#                 ''', (
+#                     data.get('e'), data.get('E'), data.get('s'), data.get('p'),
+#                     data.get('P'), data.get('w'), data.get('x'), data.get('c'),
+#                     data.get('Q'), data.get('b'), data.get('B'), data.get('a'),
+#                     data.get('A'), data.get('o'), data.get('h'), data.get('l'),
+#                     data.get('v'), data.get('q'), data.get('O'), data.get('C'),
+#                     data.get('F'), data.get('L'), data.get('n')
+#                 ))
+#     except asyncpg.PostgresError as e:
+#         logging.error(f"Database error: {e}")
+#     except KeyError as e:
+#         logging.warning(f"Missing key in data: {e}")
+#     except Exception as e:
+#         logging.error(f"Unexpected error during data saving: {e}")
 
 
 # 保存数据到 Redis
 async def save_to_redis(redis_client, data):
     try:
-        symbol = data['s']
-        price_change_percent = data['P']
+        pipeline = redis_client.pipeline()
 
-        # 将涨跌幅存入 Redis
-        await redis_client.zadd('price_change_rank', {symbol: float(price_change_percent)})
+        # 存储所有币种的详细信息
+        for item in data:
+            symbol = item['s']
+            pipeline.hset("market:details", symbol, json.dumps(item))
+
+        # 更新涨跌榜前20
+        pipeline.delete("market:top20")
+        for item in sorted(data, key=lambda x: float(x['P']), reverse=True)[:20]:
+            pipeline.zadd("market:top20", {item['s']: float(item['P'])})
+
+        await pipeline.execute()
+        logging.info("Successfully updated Redis with market details and top 20 data.")
     except Exception as e:
         logging.error(f"Error saving data to Redis: {e}")
 
@@ -137,12 +130,8 @@ async def handle_message(pool, redis_client, message):
 
         # 遍历处理列表中的每个元素
         if isinstance(data, list):
-            for item in data:
-                if validate_data(item):
-                    await save_to_db(pool, item)
-                    await save_to_redis(redis_client, item)
-                else:
-                    logging.warning(f"Invalid data skipped: {item}")
+            valid_data = [item for item in data if isinstance(item, dict) and validate_data(item)]
+            await save_to_redis(redis_client, valid_data)
         else:
             logging.warning(f"Unexpected data type: {type(data)}")
 
@@ -158,12 +147,15 @@ async def connect_to_binance(pool, redis_client):
     """
     while True:
         try:
-            async with websockets.connect(WS_URL) as websocket:
+            async with websockets.connect(WS_URL, ssl=ssl_context) as websocket:
                 logging.info("Connected to Binance WebSocket.")
                 async for message in websocket:
                     await handle_message(pool, redis_client, message)
         except websockets.exceptions.ConnectionClosedError as e:
             logging.error(f"WebSocket connection closed: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+        except (asyncio.TimeoutError, OSError) as e:
+            logging.error(f"Network error: {e}. Retrying in 5 seconds...")
             await asyncio.sleep(5)
         except Exception as e:
             logging.error(f"Unexpected error during WebScoket connection: {e}")
@@ -172,8 +164,8 @@ async def connect_to_binance(pool, redis_client):
 
 async def cleanup_resources(pool, redis_client):
     logging.info("Cleaning up resources...")
-    if pool:
-        await pool.close()
+    # if pool:
+    #     await pool.close()
     if redis_client:
         await redis_client.close()
 
@@ -181,8 +173,8 @@ async def cleanup_resources(pool, redis_client):
 # 主函数
 async def main():
     # 初始化数据库连接池和 Redis 客户端
-    pool = await asyncpg.create_pool(**DB_CONFIG)
-    redis_client = await aioredis.from_url(REDIS_URL)
+    # pool = await asyncpg.create_pool(**DB_CONFIG)
+    redis_client = redis.from_url(REDIS_URL)
 
     try:
         await connect_to_binance(pool, redis_client)
