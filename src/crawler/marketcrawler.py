@@ -98,21 +98,49 @@ def validate_data(data):
 
 # 保存数据到 Redis
 async def save_to_redis(redis_client, data):
+    """
+    保存数据到 Redis:
+    1. 存储全量币种的详细数据
+    2. 更新涨幅榜前10 和 跌幅榜前10，并保存所有字段（最新价、涨跌值、涨跌%）
+    """
     try:
         pipeline = redis_client.pipeline()
 
-        # 存储所有币种的详细信息
+        # Store full market details
         for item in data:
             symbol = item['s']
-            pipeline.hset("market:details", symbol, json.dumps(item))
+            pipeline.hset(f"market:details:{symbol}", mapping=item)
 
-        # 更新涨跌榜前20
-        pipeline.delete("market:top20")
-        for item in sorted(data, key=lambda x: float(x['P']), reverse=True)[:20]:
-            pipeline.zadd("market:top20", {item['s']: float(item['P'])})
+        # Save top gainers
+        gainers = sorted(data, key=lambda x: float(x['P']), reverse=True)[:10]
+        pipeline.delete("market:top_gainers")
+        for item in gainers:
+            symbol = item['s']
+            pipeline.zadd("market:top_gainers", {symbol: float(item['P'])})
+            pipeline.hset(f"market:top_gainers:{symbol}", mapping={
+                "latest_price": item['c'],  # Latest price
+                "price_change": item['p'],  # Price change
+                "change_percent": item['P']  # Change percentage
+            })
 
+        # Save top losers
+        losers = sorted(
+            [item for item in data if float(item['P']) < 0],
+            key=lambda x: float(x['P'])
+        )[:10]
+        pipeline.delete("market:top_losers")
+        for item in losers:
+            symbol = item['s']
+            pipeline.zadd("market:top_losers", {symbol: float(item['P'])})
+            pipeline.hset(f"market:top_losers:{symbol}", mapping={
+                "latest_price": item['c'],  # Latest price
+                "price_change": item['p'],  # Price change
+                "change_percent": item['P']  # Change percentage
+            })
+
+        # Execute pipeline
         await pipeline.execute()
-        logging.info("Successfully updated Redis with market details and top 20 data.")
+        logging.info("Successfully updated Redis with market details, top gainers, and top losers.")
     except Exception as e:
         logging.error(f"Error saving data to Redis: {e}")
 
